@@ -1,168 +1,171 @@
 // index.js
 import express from "express";
-import ffmpeg from "fluent-ffmpeg";
+import axios from "axios";
 import fs from "fs";
-import os from "os";
 import path from "path";
-import { fileURLToPath } from "url";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
+import os from "os";
+
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 
-// Per sicurezza se mai dovessi configurare un path custom
-// ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
+// directory temporanea (Render monta /tmp, ma usiamo una sottocartella nostra)
+const TMP_DIR = path.join(os.tmpdir(), "mediafx");
+if (!fs.existsSync(TMP_DIR)) {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+}
 
-// Healthcheck per Render
+// 🔧 helper: scarica una URL video in locale
+async function downloadToTmp(url, filename) {
+  const filePath = path.join(TMP_DIR, filename);
+  const writer = fs.createWriteStream(filePath);
+
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+  });
+
+  await new Promise((resolve, reject) => {
+    response.data.pipe(writer);
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+
+  return filePath;
+}
+
+// 🔧 helper: trimma un file sorgente in un nuovo file
+function trimClip(inputPath, start, duration, index) {
+  return new Promise((resolve, reject) => {
+    const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
+
+    // NB: usiamo una transcode leggera per evitare casini con copy
+    ffmpeg(inputPath)
+      .setStartTime(start)
+      .duration(duration)
+      .outputOptions([
+        "-vf scale=720:-2",  // riduciamo risoluzione per evitare problemi di RAM
+        "-preset veryfast"
+      ])
+      .output(outPath)
+      .on("end", () => {
+        resolve(outPath);
+      })
+      .on("error", (err) => {
+        console.error("Trim error:", err.message || err);
+        reject(err);
+      })
+      .run();
+  });
+}
+
+// 🔧 helper: concat di N clip in un solo file tramite concat demuxer
+function concatClips(clipPaths) {
+  return new Promise((resolve, reject) => {
+    const listPath = path.join(TMP_DIR, "concat_list.txt");
+    const outPath = path.join(TMP_DIR, `montage_${Date.now()}.mp4`);
+
+    const listContent = clipPaths
+      .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+      .join("\n");
+    fs.writeFileSync(listPath, listContent, "utf-8");
+
+    ffmpeg()
+      .input(listPath)
+      .inputOptions([
+        "-f concat",
+        "-safe 0"
+      ])
+      .outputOptions([
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 20",
+        "-movflags +faststart"
+      ])
+      .output(outPath)
+      .on("end", () => {
+        resolve(outPath);
+      })
+      .on("error", (err) => {
+        console.error("Montage error:", err.message || err);
+        reject(err);
+      })
+      .run();
+  });
+}
+
+// ✅ endpoint healthcheck
 app.get("/healthz", (req, res) => {
   res.status(200).send("OK");
 });
 
-/**
- * Body atteso:
- * {
- *   "clips": [
- *     { "url": "https://...", "start": 0, "duration": 2 },
- *     ...
- *   ]
- * }
- */
+// ✅ endpoint principale: /montage
+// body atteso:
+// {
+//   "clips": [
+//     { "url": "...", "start": 0, "duration": 2 },
+//     ...
+//   ]
+// }
 app.post("/montage", async (req, res) => {
   try {
-    const { clips } = req.body || {};
+    const { clips } = req.body;
 
     if (!Array.isArray(clips) || clips.length === 0) {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // Limita il numero di clip per non esplodere sui free tier
-    const safeClips = clips.slice(0, 12);
-
-    // Cartella temporanea per questa richiesta
-    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "mediafx-"));
-
-    const trimmedFiles = [];
-
-    // --- 1) TRIM SEQUENZIALE DELLE CLIP ---
+    // 🔒 sicurezza: limitiamo un po' (per il free tier Render)
+    const limitedClips = clips.slice(0, 10); // max 10 clip
     let index = 0;
-    for (const clip of safeClips) {
-      const { url, start, duration } = clip;
 
-      if (!url || typeof start !== "number" || typeof duration !== "number") {
-        console.warn("Clip invalid:", clip);
-        continue;
+    // 1) scarica tutte le sorgenti (per url ripetuti riusiamo il file)
+    const sourceCache = new Map(); // url -> localPath
+    for (const clip of limitedClips) {
+      if (!sourceCache.has(clip.url)) {
+        const localPath = await downloadToTmp(
+          clip.url,
+          `source_${sourceCache.size}.mp4`
+        );
+        sourceCache.set(clip.url, localPath);
       }
+    }
 
-      const outFile = path.join(workDir, `clip_${index}.mp4`);
+    // 2) trimma ogni clip in sequenza
+    const trimmedPaths = [];
+    for (const clip of limitedClips) {
+      const srcPath = sourceCache.get(clip.url);
+      const start = Number(clip.start) || 0;
+      const duration = Number(clip.duration) || 2;
+
+      const trimmed = await trimClip(srcPath, start, duration, index);
+      trimmedPaths.push(trimmed);
       index++;
-
-      console.log("Trimming clip:", { url, start, duration, outFile });
-
-      // Taglio "copy-based": NON ricodifico, taglio solo i segmenti
-      // -> molto più leggero su CPU e RAM
-      await new Promise((resolve, reject) => {
-        ffmpeg(url)
-          // ss come inputOption per taglio più preciso
-          .inputOptions([`-ss ${start}`])
-          .outputOptions([
-            `-t ${duration}`,
-            "-c copy",
-            "-movflags +faststart",
-            "-avoid_negative_ts make_zero"
-          ])
-          .on("end", () => {
-            console.log("Trim ok:", outFile);
-            resolve();
-          })
-          .on("error", (err) => {
-            console.error("Trim error for", url, err.message || err);
-            reject(err);
-          })
-          .save(outFile);
-      });
-
-      trimmedFiles.push(outFile);
     }
 
-    if (trimmedFiles.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "No valid trimmed clips produced" });
-    }
+    // 3) concatena tutte le clip trimmate
+    const finalPath = await concatClips(trimmedPaths);
 
-    // --- 2) FILE DI CONCAT ---
-    const listFile = path.join(workDir, "concat.txt");
-    const concatLines = trimmedFiles
-      .map((f) => `file '${f.replace(/'/g, "'\\''")}'`)
-      .join("\n");
-    fs.writeFileSync(listFile, concatLines, "utf-8");
-
-    const outputFile = path.join(workDir, "montage_output.mp4");
-
-    console.log(
-      "Starting concat with",
-      trimmedFiles.length,
-      "clips in",
-      workDir
-    );
-
-    // --- 3) CONCAT COPY-BASED ---
-    await new Promise((resolve, reject) => {
-      ffmpeg()
-        .input(listFile)
-        .inputOptions(["-f concat", "-safe 0"])
-        .outputOptions(["-c copy", "-movflags +faststart"])
-        .on("end", () => {
-          console.log("Montage concat ok:", outputFile);
-          resolve();
-        })
-        .on("error", (err) => {
-          console.error("Montage concat error:", err.message || err);
-          reject(err);
-        })
-        .save(outputFile);
-    });
-
-    // --- 4) RISPONDO CON IL FILE VIDEO ---
-    const stat = fs.statSync(outputFile);
+    // 4) stream del file finale come MP4
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", stat.size);
 
-    const readStream = fs.createReadStream(outputFile);
-    readStream.on("error", (err) => {
-      console.error("Stream error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Stream failed" });
-      } else {
-        res.end();
-      }
+    const stream = fs.createReadStream(finalPath);
+    stream.on("error", (err) => {
+      console.error("Read stream error:", err.message || err);
+      res.status(500).end();
     });
-
-    // cleanup quando abbiamo finito di mandare il file
-    readStream.on("close", () => {
-      try {
-        for (const f of trimmedFiles) {
-          fs.existsSync(f) && fs.unlinkSync(f);
-        }
-        fs.existsSync(listFile) && fs.unlinkSync(listFile);
-        fs.existsSync(outputFile) && fs.unlinkSync(outputFile);
-        fs.existsSync(workDir) && fs.rmdirSync(workDir, { recursive: true });
-      } catch (e) {
-        console.warn("Cleanup error:", e.message || e);
-      }
-    });
-
-    readStream.pipe(res);
+    stream.pipe(res);
   } catch (err) {
-    console.error("Montage error (outer):", err);
-    res
-      .status(500)
-      .json({ error: "Montage failed", details: String(err?.message || err) });
+    console.error("Montage top-level error:", err.message || err);
+    res.status(500).json({
+      error: "Montage failed",
+      details: err.message || String(err),
+    });
   }
-});
-
-// fallback
-app.get("/", (req, res) => {
-  res.status(200).send("MediaFX montage service up");
 });
 
 const PORT = process.env.PORT || 3000;
