@@ -39,17 +39,20 @@ async function downloadToTmp(url, filename) {
 }
 
 // 🔧 helper: trimma un file sorgente in un nuovo file
+// 🔧 helper: trimma un file sorgente in un nuovo file SENZA ricompressione (massima qualità)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
-    // NB: usiamo una transcode leggera per evitare casini con copy
     ffmpeg(inputPath)
-      .setStartTime(start)
-      .duration(duration)
+      // taglio usando seek in input (più preciso / efficiente)
+      .inputOptions([
+        `-ss ${start}`
+      ])
       .outputOptions([
-        "-vf scale=720:-2",  // riduciamo risoluzione per evitare problemi di RAM
-        "-preset veryfast"
+        `-t ${duration}`,
+        "-c copy",                    // nessuna ricompressione
+        "-avoid_negative_ts make_zero"
       ])
       .output(outPath)
       .on("end", () => {
@@ -62,6 +65,7 @@ function trimClip(inputPath, start, duration, index) {
       .run();
   });
 }
+
 
 // 🔧 helper: concat di N clip in un solo file tramite concat demuxer
 function concatClips(clipPaths) {
