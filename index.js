@@ -1,108 +1,134 @@
-// index.js
 import express from "express";
 import fetch from "node-fetch";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
 
-// Configura fluent-ffmpeg con il binario statico
-ffmpeg.setFfmpegPath(ffmpegPath);
-
-const app = express();
-app.use(express.json());
-
-// Utility per creare path temporanei sicuri
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function tmpPath(name) {
-  // Su Render /tmp è scrivibile
-  return path.join("/tmp", name);
-}
+// Diciamo a fluent-ffmpeg dove si trova ffmpeg
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
-// Scarica il video remoto in /tmp
-async function downloadToTmp(url, destPath) {
+const app = express();
+app.use(express.json({ limit: "1mb" }));
+
+// Helper: scarica un file video da URL in una cartella temp e restituisce il path locale
+async function downloadVideoToTemp(url, dir) {
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Download failed: ${res.status} ${res.statusText}`);
   }
+  const filename = `src-${Buffer.from(url).toString("base64").slice(0, 16)}.mp4`;
+  const filePath = path.join(dir, filename);
+  const fileStream = fs.createWriteStream(filePath);
 
   await new Promise((resolve, reject) => {
-    const fileStream = fs.createWriteStream(destPath);
     res.body.pipe(fileStream);
     res.body.on("error", reject);
     fileStream.on("finish", resolve);
-    fileStream.on("error", reject);
+  });
+
+  return filePath;
+}
+
+// Helper: esegue ffmpeg e ritorna una Promise
+function runFfmpeg(command) {
+  return new Promise((resolve, reject) => {
+    command
+      .on("end", () => resolve())
+      .on("error", (err) => reject(err))
+      .run();
   });
 }
 
-// Endpoint principale: TRIM
-app.post("/trim", async (req, res) => {
+/**
+ * POST /montage
+ * Body JSON:
+ * {
+ *   "trimPlan": [
+ *     { "videoUrl": "...", "start": 0, "duration": 2 },
+ *     { "videoUrl": "...", "start": 4, "duration": 2 },
+ *     ...
+ *   ]
+ * }
+ *
+ * Output: video finale (mp4) composto dai segmenti in ordine.
+ */
+app.post("/montage", async (req, res) => {
+  const { trimPlan } = req.body || {};
+
+  if (!Array.isArray(trimPlan) || trimPlan.length === 0) {
+    return res.status(400).json({ error: "trimPlan must be a non-empty array" });
+  }
+
+  // Crea cartella di lavoro temporanea
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "mediafx-"));
+  const segmentsDir = path.join(workDir, "segments");
+  fs.mkdirSync(segmentsDir, { recursive: true });
+
   try {
-    const { videoUrl, start, duration } = req.body || {};
-
-    if (!videoUrl || start === undefined || duration === undefined) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing required fields: videoUrl, start, duration"
-      });
+    // 1) Scarica ogni sorgente solo una volta
+    const sourceMap = new Map(); // videoUrl -> localPath
+    for (const item of trimPlan) {
+      if (!sourceMap.has(item.videoUrl)) {
+        const localPath = await downloadVideoToTemp(item.videoUrl, workDir);
+        sourceMap.set(item.videoUrl, localPath);
+      }
     }
 
-    const startSec = Number(start);
-    const durSec = Number(duration);
+    // 2) Crea i segmenti secondo il trimPlan
+    const segmentPaths = [];
+    let index = 0;
 
-    if (Number.isNaN(startSec) || Number.isNaN(durSec) || durSec <= 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid start/duration values"
-      });
+    for (const item of trimPlan) {
+      const { videoUrl, start, duration } = item;
+      const inputPath = sourceMap.get(videoUrl);
+      const segmentPath = path.join(segmentsDir, `seg-${index}.mp4`);
+      index++;
+
+      const cmd = ffmpeg(inputPath)
+        .setStartTime(start ?? 0)      // secondi
+        .setDuration(duration ?? 2)    // secondi
+        .output(segmentPath)
+        .videoCodec("copy")
+        .audioCodec("copy");
+
+      await runFfmpeg(cmd);
+      segmentPaths.push(segmentPath);
     }
 
-    const inputPath = tmpPath(`input_${Date.now()}.mp4`);
-    const outputPath = tmpPath(`trim_${Date.now()}.mp4`);
+    // 3) Crea file di lista per concat
+    const listFile = path.join(workDir, "segments.txt");
+    const listContent = segmentPaths
+      .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+      .join("\n");
+    fs.writeFileSync(listFile, listContent, "utf8");
 
-    // 1) Scarica il video sorgente
-    await downloadToTmp(videoUrl, inputPath);
+    // 4) Concatena i segmenti in un unico video
+    const outputPath = path.join(workDir, "output.mp4");
+    const concatCmd = ffmpeg()
+      .input(listFile)
+      .inputOptions(["-f concat", "-safe 0"])
+      .outputOptions(["-c copy"])
+      .output(outputPath);
 
-    // 2) Lancia ffmpeg per il trim
-    await new Promise((resolve, reject) => {
-      ffmpeg(inputPath)
-        .setStartTime(startSec)      // in secondi
-        .setDuration(durSec)         // in secondi
-        // se vuoi velocità senza ricodifica (ma funziona solo con certi formati)
-        // .outputOptions("-c copy")
-        .output(outputPath)
-        .on("end", resolve)
-        .on("error", reject)
-        .run();
-    });
+    await runFfmpeg(concatCmd);
 
-    // 3) Invia il file come risposta binaria
-    const stat = fs.statSync(outputPath);
+    // 5) Restituisci il file direttamente come risposta
     res.setHeader("Content-Type", "video/mp4");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="trimmed.mp4"'
-    );
-    res.setHeader("Content-Length", stat.size);
-
-    const readStream = fs.createReadStream(outputPath);
-    readStream.pipe(res);
-
-    // cleanup best-effort
-    readStream.on("close", () => {
-      try { fs.unlinkSync(inputPath); } catch {}
-      try { fs.unlinkSync(outputPath); } catch {}
+    const stream = fs.createReadStream(outputPath);
+    stream.pipe(res);
+    stream.on("close", () => {
+      // opzionale: potresti pulire la cartella temporanea qui
+      // fs.rmSync(workDir, { recursive: true, force: true });
     });
   } catch (err) {
-    console.error("Trim error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Internal trim error",
-      details: err.message
-    });
+    console.error("Error in /montage:", err);
+    return res.status(500).json({ error: err.message });
   }
 });
 
