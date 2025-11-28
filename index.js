@@ -1,85 +1,108 @@
 // index.js
 import express from "express";
-import ffmpeg from "fluent-ffmpeg";
-import ffmpegPath from "ffmpeg-static";
 import fetch from "node-fetch";
 import fs from "fs";
-import { pipeline } from "stream";
-import { promisify } from "util";
-import { randomUUID } from "crypto";
+import path from "path";
+import { fileURLToPath } from "url";
+import ffmpeg from "fluent-ffmpeg";
+import ffmpegPath from "ffmpeg-static";
+
+// Configura fluent-ffmpeg con il binario statico
+ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(express.json());
 
-// configuriamo fluent-ffmpeg per usare il binario di ffmpeg-static
-ffmpeg.setFfmpegPath(ffmpegPath);
+// Utility per creare path temporanei sicuri
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// pipeline promisificata per stream (download file)
-const streamPipeline = promisify(pipeline);
+function tmpPath(name) {
+  // Su Render /tmp è scrivibile
+  return path.join("/tmp", name);
+}
 
-/**
- * POST /trim
- * body: { videoUrl: string, start: number (sec), duration: number (sec) }
- * ritorna: { ok: true, segmentUrl, start, duration }
- */
+// Scarica il video remoto in /tmp
+async function downloadToTmp(url, destPath) {
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  }
+
+  await new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(destPath);
+    res.body.pipe(fileStream);
+    res.body.on("error", reject);
+    fileStream.on("finish", resolve);
+    fileStream.on("error", reject);
+  });
+}
+
+// Endpoint principale: TRIM
 app.post("/trim", async (req, res) => {
   try {
     const { videoUrl, start, duration } = req.body || {};
 
-    if (!videoUrl) {
-      return res.status(400).json({ ok: false, error: "Missing videoUrl" });
-    }
-
-    const startSec = Number(start) || 0;
-    const durationSec = Number(duration) || 2;
-
-    if (durationSec <= 0) {
-      return res.status(400).json({ ok: false, error: "Invalid duration" });
-    }
-
-    // percorsi locali temporanei (Render permette di scrivere in /tmp)
-    const id = randomUUID();
-    const inputPath = `/tmp/input-${id}.mp4`;
-    const outputPath = `/tmp/output-${id}.mp4`;
-
-    // 1) scarico il video da videoUrl su /tmp/input-<id>.mp4
-    const response = await fetch(videoUrl);
-    if (!response.ok || !response.body) {
-      return res.status(500).json({
+    if (!videoUrl || start === undefined || duration === undefined) {
+      return res.status(400).json({
         ok: false,
-        error: `Failed to download video: ${response.status} ${response.statusText}`,
+        error: "Missing required fields: videoUrl, start, duration"
       });
     }
 
-    await streamPipeline(response.body, fs.createWriteStream(inputPath));
+    const startSec = Number(start);
+    const durSec = Number(duration);
 
-    // 2) trim con ffmpeg
+    if (Number.isNaN(startSec) || Number.isNaN(durSec) || durSec <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid start/duration values"
+      });
+    }
+
+    const inputPath = tmpPath(`input_${Date.now()}.mp4`);
+    const outputPath = tmpPath(`trim_${Date.now()}.mp4`);
+
+    // 1) Scarica il video sorgente
+    await downloadToTmp(videoUrl, inputPath);
+
+    // 2) Lancia ffmpeg per il trim
     await new Promise((resolve, reject) => {
       ffmpeg(inputPath)
-        .setStartTime(startSec)       // in secondi
-        .setDuration(durationSec)     // in secondi
-        // se vuoi massima velocità e il video lo consente:
+        .setStartTime(startSec)      // in secondi
+        .setDuration(durSec)         // in secondi
+        // se vuoi velocità senza ricodifica (ma funziona solo con certi formati)
         // .outputOptions("-c copy")
         .output(outputPath)
         .on("end", resolve)
-        .on("error", (err) => reject(err))
+        .on("error", reject)
         .run();
     });
 
-    // 3) costruisco URL pubblico per il file
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    const fileName = outputPath.split("/").pop();
-    const segmentUrl = `${baseUrl}/files/${fileName}`;
+    // 3) Invia il file come risposta binaria
+    const stat = fs.statSync(outputPath);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="trimmed.mp4"'
+    );
+    res.setHeader("Content-Length", stat.size);
 
-    return res.json({
-      ok: true,
-      segmentUrl,
-      start: startSec,
-      duration: durationSec,
+    const readStream = fs.createReadStream(outputPath);
+    readStream.pipe(res);
+
+    // cleanup best-effort
+    readStream.on("close", () => {
+      try { fs.unlinkSync(inputPath); } catch {}
+      try { fs.unlinkSync(outputPath); } catch {}
     });
   } catch (err) {
-    console.error("Error in /trim:", err);
-    return res.status(500).json({ ok: false, error: err.message || "Unknown error" });
+    console.error("Trim error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Internal trim error",
+      details: err.message
+    });
   }
 });
 
@@ -87,9 +110,6 @@ app.post("/trim", async (req, res) => {
 app.get("/healthz", (req, res) => {
   res.status(200).send("OK");
 });
-
-// esponiamo la cartella /tmp come static per servire i segmenti
-app.use("/files", express.static("/tmp"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
