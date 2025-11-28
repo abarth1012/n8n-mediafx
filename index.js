@@ -1,19 +1,26 @@
-import express from 'express';
-
+// index.js
+import express from "express";
 const app = express();
+
 app.use(express.json());
 
-// health check (Render lo userà se gli metti /healthz)
-app.get('/healthz', (req, res) => {
-  res.status(200).send('ok');
+app.post("/trim", async (req, res) => {
+  const { videoUrl, start, duration } = req.body;
+
+  // TODO: qui fai il vero trim con ffmpeg e salvi il file (S3, tmpfiles, ecc.)
+  // Per ora puoi fare solo un echo di test:
+  return res.json({
+    ok: true,
+    received: { videoUrl, start, duration },
+  });
 });
 
-// endpoint di test
-app.get('/', (req, res) => {
-  res.send('n8n-mediafx service is running');
+// healthcheck per Render
+app.get("/healthz", (req, res) => {
+  res.status(200).send("OK");
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log("MediaFX service listening on", PORT);
 });
