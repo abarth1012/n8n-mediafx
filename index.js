@@ -85,9 +85,7 @@ function concatClips(clipPaths) {
         "-safe 0"
       ])
       .outputOptions([
-        "-c:v libx264",
-        "-preset veryfast",
-        "-crf 20",
+        "-c copy",           // non ricomprime il video
         "-movflags +faststart"
       ])
       .output(outPath)
@@ -101,6 +99,8 @@ function concatClips(clipPaths) {
       .run();
   });
 }
+
+
 
 // ✅ endpoint healthcheck
 app.get("/healthz", (req, res) => {
