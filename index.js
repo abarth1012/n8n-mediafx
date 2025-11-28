@@ -1,34 +1,19 @@
-import express from "express";
-import bodyParser from "body-parser";
-import { trimVideo } from "@dandacompany/mediafx";
+import express from 'express';
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
-app.post("/trim", async (req, res) => {
-    try {
-        const { url, start, duration } = req.body;
-
-        if (!url) return res.status(400).json({ error: "Missing video url" });
-
-        const output = await trimVideo({
-            input: url,
-            startTime: start || 0,
-            duration: duration || 5,
-            output: "output.mp4"
-        });
-
-        res.json({
-            success: true,
-            file_url: output
-        });
-
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+// health check (Render lo userà se gli metti /healthz)
+app.get('/healthz', (req, res) => {
+  res.status(200).send('ok');
 });
 
-app.get("/", (_, res) => res.send("MediaFX microservice online."));
-app.listen(process.env.PORT || 3000, () =>
-    console.log("Service running")
-);
+// endpoint di test
+app.get('/', (req, res) => {
+  res.send('n8n-mediafx service is running');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
