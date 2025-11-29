@@ -38,30 +38,28 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim di una clip SENZA ricodifica (stream copy)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      .setStartTime(start)         // -ss
-      .duration(duration)          // -t
+      .setStartTime(start)
+      .duration(duration)
       .outputOptions([
-        "-c copy",                 // niente re-encode: stessa qualità
-        "-movflags +faststart",
+        "-c:v libx264",
+        "-preset ultrafast",
+        "-crf 18",
+        "-c:a aac",
+        "-b:a 192k",
+        "-movflags +faststart"
       ])
       .output(outPath)
-      .on("end", () => {
-        console.log("Trim ok:", outPath);
-        resolve(outPath);
-      })
-      .on("error", (err) => {
-        console.error("Trim error:", err.message || err);
-        reject(err);
-      })
+      .on("end", () => resolve(outPath))
+      .on("error", (err) => reject(err))
       .run();
   });
 }
+
 
 // 🔧 Concat di N clip tramite concat demuxer, sempre in copy
 function concatClips(clipPaths) {
