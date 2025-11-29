@@ -39,32 +39,24 @@ async function downloadToTmp(url, filename) {
 }
 
 // 🔧 Trim di una clip con transcode leggero a 720p
-// (unica ricodifica pesante, niente copy qui)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      .setStartTime(start)           // -ss
-      .duration(duration)            // -t
+      .setStartTime(start)
+      .duration(duration)
       .outputOptions([
-        "-vf scale=720:-2,fps=25",   // 720p + fps fisso → tagli più fluidi
         "-c:v libx264",
+        "-preset veryfast",
+        "-crf 18",
         "-c:a aac",
         "-b:a 128k",
-        "-preset veryfast",          // più leggero per il free tier
-        "-crf 21",                   // qualità buona, file non enormi
-        "-movflags +faststart",
+        "-avoid_negative_ts make_zero"
       ])
       .output(outPath)
-      .on("end", () => {
-        console.log("Trim ok:", outPath);
-        resolve(outPath);
-      })
-      .on("error", (err) => {
-        console.error("Trim error:", err.message || err);
-        reject(err);
-      })
+      .on("end", () => resolve(outPath))
+      .on("error", reject)
       .run();
   });
 }
@@ -87,9 +79,14 @@ function concatClips(clipPaths) {
         "-safe 0",
       ])
       .outputOptions([
-        "-c copy",               // nessuna seconda ricodifica
-        "-movflags +faststart",
-      ])
+  "-c:v libx264",
+  "-preset veryfast",
+  "-crf 18",
+  "-pix_fmt yuv420p",
+  "-c:a aac",
+  "-b:a 128k",
+  "-movflags +faststart"
+])
       .output(outPath)
       .on("end", () => {
         console.log("Montage concat ok:", outPath);
