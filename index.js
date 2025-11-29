@@ -38,30 +38,38 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
+// 🔧 Trim di una clip con transcode leggero a 720p
+// (unica ricodifica pesante, niente copy qui)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      .setStartTime(start)
-      .duration(duration)
+      .setStartTime(start)           // -ss
+      .duration(duration)            // -t
       .outputOptions([
+        "-vf scale=720:-2,fps=25",   // 720p + fps fisso → tagli più fluidi
         "-c:v libx264",
-        "-preset ultrafast",
-        "-crf 18",
         "-c:a aac",
-        "-b:a 192k",
-        "-movflags +faststart"
+        "-b:a 128k",
+        "-preset veryfast",          // più leggero per il free tier
+        "-crf 21",                   // qualità buona, file non enormi
+        "-movflags +faststart",
       ])
       .output(outPath)
-      .on("end", () => resolve(outPath))
-      .on("error", (err) => reject(err))
+      .on("end", () => {
+        console.log("Trim ok:", outPath);
+        resolve(outPath);
+      })
+      .on("error", (err) => {
+        console.error("Trim error:", err.message || err);
+        reject(err);
+      })
       .run();
   });
 }
 
-
-// 🔧 Concat di N clip tramite concat demuxer, sempre in copy
+// 🔧 Concat di N clip già uniformi → copy (zero re-encode)
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
@@ -79,7 +87,7 @@ function concatClips(clipPaths) {
         "-safe 0",
       ])
       .outputOptions([
-        "-c copy",                 // di nuovo: niente re-encode
+        "-c copy",               // nessuna seconda ricodifica
         "-movflags +faststart",
       ])
       .output(outPath)
@@ -102,12 +110,7 @@ app.get("/healthz", (req, res) => {
 
 // ✅ endpoint principale: /montage
 // Body atteso:
-// {
-//   "clips": [
-//     { "url": "...", "start": 0, "duration": 2 },
-//     ...
-//   ]
-// }
+// { "clips": [ { "url": "...", "start": 0, "duration": 2 }, ... ] }
 app.post("/montage", async (req, res) => {
   try {
     const { clips } = req.body;
@@ -116,8 +119,8 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // Per sicurezza: massimo 10 clip
-    const limitedClips = clips.slice(0, 10);
+    // Free tier safety: max 8 clip
+    const limitedClips = clips.slice(0, 8);
     const sourceCache = new Map();   // url -> localPath
 
     // 1) Scarica le sorgenti (una volta sola per URL)
@@ -144,7 +147,7 @@ app.post("/montage", async (req, res) => {
       index++;
     }
 
-    // 3) Concat finale
+    // 3) Concat finale (copy)
     const finalPath = await concatClips(trimmedPaths);
 
     // 4) Stream del file finale come MP4
@@ -166,41 +169,7 @@ app.post("/montage", async (req, res) => {
   }
 });
 
-// ======================
-// PREVIEW ENDPOINT (<50MB)
-// ======================
-app.post("/preview", async (req, res) => {
-  try {
-    const { videoUrl } = req.body;
-    if (!videoUrl) return res.status(400).json({ error: "Missing videoUrl" });
-
-    const srcPath = await downloadToTmp(videoUrl, "preview_source.mp4");
-    const outPath = path.join(TMP_DIR, `preview_${Date.now()}.mp4`);
-
-    ffmpeg(srcPath)
-      .outputOptions([
-        "-vf scale=1280:-2",   // 720p/1080p adattivo
-        "-c:v libx264",
-        "-preset veryfast",
-        "-crf 23",             // più alto = più leggero
-        "-movflags +faststart"
-      ])
-      .on("end", () => {
-        res.setHeader("Content-Type", "video/mp4");
-        fs.createReadStream(outPath).pipe(res);
-      })
-      .on("error", err => {
-        console.error("Preview error:", err);
-        res.status(500).json({ error: "Preview failed" });
-      })
-      .save(outPath);
-
-  } catch (err) {
-    console.error("Preview top-level error:", err);
-    res.status(500).json({ error: "Preview failed" });
-  }
-});
-
+// Endpoint /preview lo puoi lasciare com’è, tanto è leggero e usato solo una volta per volta.
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
