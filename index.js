@@ -12,13 +12,21 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 const app = express();
 app.use(express.json());
 
-// directory temporanea (Render monta /tmp, noi usiamo sottocartella dedicata)
+// directory temporanea (Render monta /tmp, ma usiamo una sottocartella nostra)
 const TMP_DIR = path.join(os.tmpdir(), "mediafx");
 if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
 }
 
-// 🔧 scarica una URL video in locale
+// --- PARAMETRI QUALITÀ (modificabili) ---
+// Risoluzione massima del trim (larghezza). Altezza è proporzionale.
+const MAX_WIDTH = 1920;   // 1080p circa (se vuoi stare ultra safe: 1280)
+// Qualità H.264: più basso = migliore qualità, più pesante. 18 è molto buono.
+const TRIM_CRF = 18;
+// Preset: veryfast = più leggero per Render
+const TRIM_PRESET = "veryfast";
+
+// 🔧 helper: scarica una URL video in locale
 async function downloadToTmp(url, filename) {
   const filePath = path.join(TMP_DIR, filename);
   const writer = fs.createWriteStream(filePath);
@@ -38,22 +46,23 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 trimma una clip in formato già "preview friendly"
+// 🔧 helper: trimma un file sorgente in un nuovo file
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
+    // Ricodifichiamo in H.264 + AAC, fino a MAX_WIDTH, CRF buono
     ffmpeg(inputPath)
       .setStartTime(start)
       .duration(duration)
       .videoCodec("libx264")
       .audioCodec("aac")
       .outputOptions([
-        // 👉 preview: limitiamo a circa 720p per stare leggeri
-        "-vf scale=1280:-2",
-        "-preset veryfast",
-        // 👉 CRF più alto = file più piccolo; 22–24 è ok per Telegram
-        "-crf 23",
+        // ridimensiona SOLO se il video è più largo di MAX_WIDTH
+        // (ffmpeg scala comunque, ma per input più piccoli l'effetto è minimo)
+        `-vf scale='min(${MAX_WIDTH},iw)':-2`,
+        `-preset ${TRIM_PRESET}`,
+        `-crf ${TRIM_CRF}`,
         "-movflags +faststart",
       ])
       .output(outPath)
@@ -68,7 +77,7 @@ function trimClip(inputPath, start, duration, index) {
   });
 }
 
-// 🔧 concat delle clip trimmate in un unico file (ricompressione leggera)
+// 🔧 helper: concat di N clip in un solo file tramite concat demuxer
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(TMP_DIR, "concat_list.txt");
@@ -81,14 +90,15 @@ function concatClips(clipPaths) {
 
     ffmpeg()
       .input(listPath)
-      .inputOptions(["-f concat", "-safe 0"])
+      .inputOptions([
+        "-f concat",
+        "-safe 0",
+      ])
+      // niente ricompressione: copiamo i flussi già uniformati dal trim
       .outputOptions([
-        " -c:v libx264",
-        " -preset veryfast",
-        // stesso CRF della preview (puoi alzare o abbassare)
-        " -crf 23",
-        " -c:a aac",
-        " -movflags +faststart",
+        "-c:v copy",
+        "-c:a copy",
+        "-movflags +faststart",
       ])
       .output(outPath)
       .on("end", () => {
@@ -102,7 +112,7 @@ function concatClips(clipPaths) {
   });
 }
 
-// ✅ healthcheck per Render
+// ✅ endpoint healthcheck
 app.get("/healthz", (req, res) => {
   res.status(200).send("OK");
 });
@@ -123,11 +133,11 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // 🔒 sicurezza: limitiamo il numero di clip per non esplodere in RAM
+    // 🔒 sicurezza: limitiamo un po' (per il free tier Render)
     const limitedClips = clips.slice(0, 10); // max 10 clip
     let index = 0;
 
-    // 1) scarica tutte le sorgenti (riuso su URL ripetuti)
+    // 1) scarica tutte le sorgenti (per url ripetuti riusiamo il file)
     const sourceCache = new Map(); // url -> localPath
     for (const clip of limitedClips) {
       if (!sourceCache.has(clip.url)) {
@@ -139,7 +149,7 @@ app.post("/montage", async (req, res) => {
       }
     }
 
-    // 2) trim sequenziale (meno RAM, nessuna concorrenza)
+    // 2) trimma ogni clip in sequenza
     const trimmedPaths = [];
     for (const clip of limitedClips) {
       const srcPath = sourceCache.get(clip.url);
@@ -151,10 +161,10 @@ app.post("/montage", async (req, res) => {
       index++;
     }
 
-    // 3) concatena
+    // 3) concatena tutte le clip trimmate
     const finalPath = await concatClips(trimmedPaths);
 
-    // 4) stream del file finale (preview) come MP4
+    // 4) stream del file finale come MP4
     res.setHeader("Content-Type", "video/mp4");
 
     const stream = fs.createReadStream(finalPath);
