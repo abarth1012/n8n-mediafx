@@ -12,13 +12,13 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 const app = express();
 app.use(express.json());
 
-// directory temporanea (Render monta /tmp, ma usiamo una sottocartella nostra)
+// Cartella temporanea (Render monta /tmp)
 const TMP_DIR = path.join(os.tmpdir(), "mediafx");
 if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
 }
 
-// 🔧 helper: scarica una URL video in locale
+// 🔧 Scarica una URL video in locale
 async function downloadToTmp(url, filename) {
   const filePath = path.join(TMP_DIR, filename);
   const writer = fs.createWriteStream(filePath);
@@ -38,21 +38,21 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 helper: trimma un file sorgente in un nuovo file
+// 🔧 Trim di una clip SENZA ricodifica (stream copy)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
-    // NB: usiamo una transcode leggera per evitare casini con copy
     ffmpeg(inputPath)
-      .setStartTime(start)
-      .duration(duration)
+      .setStartTime(start)         // -ss
+      .duration(duration)          // -t
       .outputOptions([
-        "-vf scale=720:-2",  // riduciamo risoluzione per evitare problemi di RAM
-        "-preset veryfast"
+        "-c copy",                 // niente re-encode: stessa qualità
+        "-movflags +faststart",
       ])
       .output(outPath)
       .on("end", () => {
+        console.log("Trim ok:", outPath);
         resolve(outPath);
       })
       .on("error", (err) => {
@@ -63,10 +63,10 @@ function trimClip(inputPath, start, duration, index) {
   });
 }
 
-// 🔧 helper: concat di N clip in un solo file tramite concat demuxer
+// 🔧 Concat di N clip tramite concat demuxer, sempre in copy
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
-    const listPath = path.join(TMP_DIR, "concat_list.txt");
+    const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
     const outPath = path.join(TMP_DIR, `montage_${Date.now()}.mp4`);
 
     const listContent = clipPaths
@@ -78,16 +78,15 @@ function concatClips(clipPaths) {
       .input(listPath)
       .inputOptions([
         "-f concat",
-        "-safe 0"
+        "-safe 0",
       ])
       .outputOptions([
-        "-c:v libx264",
-        "-preset veryfast",
-        "-crf 20",
-        "-movflags +faststart"
+        "-c copy",                 // di nuovo: niente re-encode
+        "-movflags +faststart",
       ])
       .output(outPath)
       .on("end", () => {
+        console.log("Montage concat ok:", outPath);
         resolve(outPath);
       })
       .on("error", (err) => {
@@ -98,13 +97,13 @@ function concatClips(clipPaths) {
   });
 }
 
-// ✅ endpoint healthcheck
+// ✅ healthcheck per Render
 app.get("/healthz", (req, res) => {
   res.status(200).send("OK");
 });
 
 // ✅ endpoint principale: /montage
-// body atteso:
+// Body atteso:
 // {
 //   "clips": [
 //     { "url": "...", "start": 0, "duration": 2 },
@@ -119,12 +118,11 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // 🔒 sicurezza: limitiamo un po' (per il free tier Render)
-    const limitedClips = clips.slice(0, 10); // max 10 clip
-    let index = 0;
+    // Per sicurezza: massimo 10 clip
+    const limitedClips = clips.slice(0, 10);
+    const sourceCache = new Map();   // url -> localPath
 
-    // 1) scarica tutte le sorgenti (per url ripetuti riusiamo il file)
-    const sourceCache = new Map(); // url -> localPath
+    // 1) Scarica le sorgenti (una volta sola per URL)
     for (const clip of limitedClips) {
       if (!sourceCache.has(clip.url)) {
         const localPath = await downloadToTmp(
@@ -135,8 +133,9 @@ app.post("/montage", async (req, res) => {
       }
     }
 
-    // 2) trimma ogni clip in sequenza
+    // 2) Trim sequenziale di tutte le clip
     const trimmedPaths = [];
+    let index = 0;
     for (const clip of limitedClips) {
       const srcPath = sourceCache.get(clip.url);
       const start = Number(clip.start) || 0;
@@ -147,17 +146,18 @@ app.post("/montage", async (req, res) => {
       index++;
     }
 
-    // 3) concatena tutte le clip trimmate
+    // 3) Concat finale
     const finalPath = await concatClips(trimmedPaths);
 
-    // 4) stream del file finale come MP4
+    // 4) Stream del file finale come MP4
     res.setHeader("Content-Type", "video/mp4");
-
     const stream = fs.createReadStream(finalPath);
+
     stream.on("error", (err) => {
       console.error("Read stream error:", err.message || err);
       res.status(500).end();
     });
+
     stream.pipe(res);
   } catch (err) {
     console.error("Montage top-level error:", err.message || err);
@@ -167,6 +167,42 @@ app.post("/montage", async (req, res) => {
     });
   }
 });
+
+// ======================
+// PREVIEW ENDPOINT (<50MB)
+// ======================
+app.post("/preview", async (req, res) => {
+  try {
+    const { videoUrl } = req.body;
+    if (!videoUrl) return res.status(400).json({ error: "Missing videoUrl" });
+
+    const srcPath = await downloadToTmp(videoUrl, "preview_source.mp4");
+    const outPath = path.join(TMP_DIR, `preview_${Date.now()}.mp4`);
+
+    ffmpeg(srcPath)
+      .outputOptions([
+        "-vf scale=1280:-2",   // 720p/1080p adattivo
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",             // più alto = più leggero
+        "-movflags +faststart"
+      ])
+      .on("end", () => {
+        res.setHeader("Content-Type", "video/mp4");
+        fs.createReadStream(outPath).pipe(res);
+      })
+      .on("error", err => {
+        console.error("Preview error:", err);
+        res.status(500).json({ error: "Preview failed" });
+      })
+      .save(outPath);
+
+  } catch (err) {
+    console.error("Preview top-level error:", err);
+    res.status(500).json({ error: "Preview failed" });
+  }
+});
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
