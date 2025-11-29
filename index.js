@@ -39,32 +39,34 @@ async function downloadToTmp(url, filename) {
 }
 
 // 🔧 helper: trimma un file sorgente in un nuovo file
-// 🔧 helper: trimma un file sorgente in un nuovo file SENZA ricompressione (massima qualità)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      // taglio usando seek in input (più preciso / efficiente)
-      .inputOptions([
-        `-ss ${start}`
-      ])
+      .setStartTime(start)
+      .duration(duration)
+      // codec video + qualità alta (CRF basso) 
+      .videoCodec('libx264')
+      .audioCodec('aac')
       .outputOptions([
-        `-t ${duration}`,
-        "-c copy",                    // nessuna ricompressione
-        "-avoid_negative_ts make_zero"
+        // niente scale: mantieni la risoluzione originale
+        '-preset medium',   // puoi aumentare a 'slow' se Render regge
+        '-crf 17',          // 16–18 = quasi lossless visivamente
+        '-movflags +faststart'
       ])
       .output(outPath)
-      .on("end", () => {
+      .on('end', () => {
         resolve(outPath);
       })
-      .on("error", (err) => {
-        console.error("Trim error:", err.message || err);
+      .on('error', (err) => {
+        console.error('Trim error:', err.message || err);
         reject(err);
       })
       .run();
   });
 }
+
 
 
 // 🔧 helper: concat di N clip in un solo file tramite concat demuxer
@@ -84,8 +86,10 @@ function concatClips(clipPaths) {
         "-f concat",
         "-safe 0"
       ])
+      // qui possiamo copiare, tanto tutte le clip hanno già stesso codec/profilo
       .outputOptions([
-        "-c copy",           // non ricomprime il video
+        "-c:v copy",
+        "-c:a copy",
         "-movflags +faststart"
       ])
       .output(outPath)
@@ -99,6 +103,7 @@ function concatClips(clipPaths) {
       .run();
   });
 }
+
 
 
 
