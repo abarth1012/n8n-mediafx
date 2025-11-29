@@ -38,39 +38,39 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim di una clip con transcode leggero a 720p
+// 🔧 Trim di una clip con transcode leggera (più qualità del 720p)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      .setStartTime(start)
-      .duration(duration)
-      // codec video + qualità alta (CRF basso) 
-      .videoCodec('libx264')
-      .audioCodec('aac')
+      .setStartTime(start)       // -ss
+      .duration(duration)        // -t
+      .videoCodec("libx264")
+      .audioCodec("aac")
       .outputOptions([
-        // niente scale: mantieni la risoluzione originale
-        '-preset medium',   // puoi aumentare a 'slow' se Render regge
-        '-crf 17',          // 16–18 = quasi lossless visivamente
-        '-movflags +faststart'
+        "-vf scale=960:-2",      // 🔼 da 720 a 960 px di larghezza
+        "-preset veryfast",
+        "-crf 19",               // qualità leggermente migliore
+        "-movflags +faststart",
       ])
       .output(outPath)
-      .on('end', () => {
+      .on("end", () => {
+        console.log("Trim ok:", outPath);
         resolve(outPath);
       })
-      .on('error', (err) => {
-        console.error('Trim error:', err.message || err);
+      .on("error", (err) => {
+        console.error("Trim error:", err.message || err);
         reject(err);
       })
       .run();
   });
 }
 
-// 🔧 Concat di N clip già uniformi → copy (zero re-encode)
+// 🔧 Concat di N clip tramite concat demuxer
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
-    const listPath = path.join(TMP_DIR, "concat_list.txt");
+    const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
     const outPath = path.join(TMP_DIR, `montage_${Date.now()}.mp4`);
 
     const listContent = clipPaths
@@ -82,16 +82,17 @@ function concatClips(clipPaths) {
       .input(listPath)
       .inputOptions([
         "-f concat",
-        "-safe 0"
+        "-safe 0",
       ])
-      // qui possiamo copiare, tanto tutte le clip hanno già stesso codec/profilo
       .outputOptions([
-        "-c:v copy",
-        "-c:a copy",
-        "-movflags +faststart"
+        "-c:v libx264",
+        "-crf 20",               // leggera compressione finale
+        "-preset veryfast",
+        "-movflags +faststart",
       ])
       .output(outPath)
       .on("end", () => {
+        console.log("Montage concat ok:", outPath);
         resolve(outPath);
       })
       .on("error", (err) => {
@@ -102,15 +103,12 @@ function concatClips(clipPaths) {
   });
 }
 
-
 // ✅ healthcheck per Render
 app.get("/healthz", (req, res) => {
   res.status(200).send("OK");
 });
 
 // ✅ endpoint principale: /montage
-// Body atteso:
-// { "clips": [ { "url": "...", "start": 0, "duration": 2 }, ... ] }
 app.post("/montage", async (req, res) => {
   try {
     const { clips } = req.body;
@@ -119,8 +117,9 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // Free tier safety: max 8 clip
-    const limitedClips = clips.slice(0, 8);
+    // 👉 QUI: assicuriamoci di usare TUTTE le 10 clip
+    const limitedClips = clips.slice(0, 10);  // 10 clip max = 20s totali
+
     const sourceCache = new Map();   // url -> localPath
 
     // 1) Scarica le sorgenti (una volta sola per URL)
@@ -147,7 +146,7 @@ app.post("/montage", async (req, res) => {
       index++;
     }
 
-    // 3) Concat finale (copy)
+    // 3) Concat finale
     const finalPath = await concatClips(trimmedPaths);
 
     // 4) Stream del file finale come MP4
@@ -168,8 +167,6 @@ app.post("/montage", async (req, res) => {
     });
   }
 });
-
-// Endpoint /preview lo puoi lasciare com’è, tanto è leggero e usato solo una volta per volta.
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
