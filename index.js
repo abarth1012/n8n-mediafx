@@ -168,6 +168,42 @@ app.post("/montage", async (req, res) => {
   }
 });
 
+// ======================
+// PREVIEW ENDPOINT (<50MB)
+// ======================
+app.post("/preview", async (req, res) => {
+  try {
+    const { videoUrl } = req.body;
+    if (!videoUrl) return res.status(400).json({ error: "Missing videoUrl" });
+
+    const srcPath = await downloadToTmp(videoUrl, "preview_source.mp4");
+    const outPath = path.join(TMP_DIR, `preview_${Date.now()}.mp4`);
+
+    ffmpeg(srcPath)
+      .outputOptions([
+        "-vf scale=1280:-2",   // 720p/1080p adattivo
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 23",             // più alto = più leggero
+        "-movflags +faststart"
+      ])
+      .on("end", () => {
+        res.setHeader("Content-Type", "video/mp4");
+        fs.createReadStream(outPath).pipe(res);
+      })
+      .on("error", err => {
+        console.error("Preview error:", err);
+        res.status(500).json({ error: "Preview failed" });
+      })
+      .save(outPath);
+
+  } catch (err) {
+    console.error("Preview top-level error:", err);
+    res.status(500).json({ error: "Preview failed" });
+  }
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("MediaFX service listening on", PORT);
