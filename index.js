@@ -46,17 +46,23 @@ function trimClip(inputPath, start, duration, index) {
     ffmpeg(inputPath)
       .setStartTime(start)
       .duration(duration)
+      // codec video + qualità alta (CRF basso) 
+      .videoCodec('libx264')
+      .audioCodec('aac')
       .outputOptions([
-        "-c:v libx264",
-        "-preset veryfast",
-        "-crf 18",
-        "-c:a aac",
-        "-b:a 128k",
-        "-avoid_negative_ts make_zero"
+        // niente scale: mantieni la risoluzione originale
+        '-preset medium',   // puoi aumentare a 'slow' se Render regge
+        '-crf 17',          // 16–18 = quasi lossless visivamente
+        '-movflags +faststart'
       ])
       .output(outPath)
-      .on("end", () => resolve(outPath))
-      .on("error", reject)
+      .on('end', () => {
+        resolve(outPath);
+      })
+      .on('error', (err) => {
+        console.error('Trim error:', err.message || err);
+        reject(err);
+      })
       .run();
   });
 }
@@ -64,7 +70,7 @@ function trimClip(inputPath, start, duration, index) {
 // 🔧 Concat di N clip già uniformi → copy (zero re-encode)
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
-    const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
+    const listPath = path.join(TMP_DIR, "concat_list.txt");
     const outPath = path.join(TMP_DIR, `montage_${Date.now()}.mp4`);
 
     const listContent = clipPaths
@@ -76,20 +82,16 @@ function concatClips(clipPaths) {
       .input(listPath)
       .inputOptions([
         "-f concat",
-        "-safe 0",
+        "-safe 0"
       ])
+      // qui possiamo copiare, tanto tutte le clip hanno già stesso codec/profilo
       .outputOptions([
-  "-c:v libx264",
-  "-preset veryfast",
-  "-crf 18",
-  "-pix_fmt yuv420p",
-  "-c:a aac",
-  "-b:a 128k",
-  "-movflags +faststart"
-])
+        "-c:v copy",
+        "-c:a copy",
+        "-movflags +faststart"
+      ])
       .output(outPath)
       .on("end", () => {
-        console.log("Montage concat ok:", outPath);
         resolve(outPath);
       })
       .on("error", (err) => {
@@ -99,6 +101,7 @@ function concatClips(clipPaths) {
       .run();
   });
 }
+
 
 // ✅ healthcheck per Render
 app.get("/healthz", (req, res) => {
