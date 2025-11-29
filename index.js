@@ -38,20 +38,20 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 helper: trimma un file sorgente in un nuovo file (con re-encode "leggero" ma di qualità)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      .setStartTime(start)           // da dove iniziare
-      .duration(duration)           // quanto deve durare la clip
-      .videoCodec("libx264")        // ricodifica video
-      .audioCodec("aac")            // ricodifica audio
+      .setStartTime(start)       // taglio da N secondi
+      .duration(duration)        // lunghezza segmento
+      .videoCodec("libx264")     // ricodifica video
+      .audioCodec("aac")         // ricodifica audio (standard)
       .outputOptions([
-        "-preset veryfast",         // più veloce, meno CPU
-        "-crf 18",                  // qualità alta (più basso = più qualità, più peso). 18 è un buon compromesso
-        "-movflags +faststart"
+        "-preset veryfast",      // bilancia CPU vs qualità
+        "-crf 20",               // qualità alta, ma non folle (più basso = più qualità/peso)
+        "-movflags +faststart",  // utile per playback web/telegram
+        "-threads 1"             // limita uso RAM e CPU su Render free
       ])
       .output(outPath)
       .on("end", () => {
@@ -64,6 +64,7 @@ function trimClip(inputPath, start, duration, index) {
       .run();
   });
 }
+
 
 
 // 🔧 Concat di N clip tramite concat demuxer, sempre in copy
