@@ -18,14 +18,6 @@ if (!fs.existsSync(TMP_DIR)) {
   fs.mkdirSync(TMP_DIR, { recursive: true });
 }
 
-// --- PARAMETRI QUALITÀ (modificabili) ---
-// Risoluzione massima del trim (larghezza). Altezza è proporzionale.
-const MAX_WIDTH = 1920;   // 1080p circa (se vuoi stare ultra safe: 1280)
-// Qualità H.264: più basso = migliore qualità, più pesante. 18 è molto buono.
-const TRIM_CRF = 18;
-// Preset: veryfast = più leggero per Render
-const TRIM_PRESET = "veryfast";
-
 // 🔧 helper: scarica una URL video in locale
 async function downloadToTmp(url, filename) {
   const filePath = path.join(TMP_DIR, filename);
@@ -51,19 +43,13 @@ function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
-    // Ricodifichiamo in H.264 + AAC, fino a MAX_WIDTH, CRF buono
+    // NB: usiamo una transcode leggera per evitare casini con copy
     ffmpeg(inputPath)
       .setStartTime(start)
       .duration(duration)
-      .videoCodec("libx264")
-      .audioCodec("aac")
       .outputOptions([
-        // ridimensiona SOLO se il video è più largo di MAX_WIDTH
-        // (ffmpeg scala comunque, ma per input più piccoli l'effetto è minimo)
-        `-vf scale='min(${MAX_WIDTH},iw)':-2`,
-        `-preset ${TRIM_PRESET}`,
-        `-crf ${TRIM_CRF}`,
-        "-movflags +faststart",
+        "-vf scale=720:-2",  // riduciamo risoluzione per evitare problemi di RAM
+        "-preset veryfast"
       ])
       .output(outPath)
       .on("end", () => {
@@ -92,13 +78,13 @@ function concatClips(clipPaths) {
       .input(listPath)
       .inputOptions([
         "-f concat",
-        "-safe 0",
+        "-safe 0"
       ])
-      // niente ricompressione: copiamo i flussi già uniformati dal trim
       .outputOptions([
-        "-c:v copy",
-        "-c:a copy",
-        "-movflags +faststart",
+        "-c:v libx264",
+        "-preset veryfast",
+        "-crf 20",
+        "-movflags +faststart"
       ])
       .output(outPath)
       .on("end", () => {
@@ -143,7 +129,7 @@ app.post("/montage", async (req, res) => {
       if (!sourceCache.has(clip.url)) {
         const localPath = await downloadToTmp(
           clip.url,
-          `source_${sourceCache.size}.mp4`,
+          `source_${sourceCache.size}.mp4`
         );
         sourceCache.set(clip.url, localPath);
       }
