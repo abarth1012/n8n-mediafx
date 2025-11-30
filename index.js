@@ -15,7 +15,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Il body è solo JSON, quindi 1MB basta e avanza
+// Body solo JSON, basta 1MB
 app.use(express.json({ limit: '1mb' }));
 
 const TMP_ROOT = path.join(os.tmpdir(), 'mediafx');
@@ -25,12 +25,10 @@ function log(...args) {
   console.log('[mediafx]', ...args);
 }
 
-/**
- * Scarica un video remoto su file temporaneo (streaming, zero buffering grosso in RAM).
- */
-async function downloadSource(url, key) {
+// Download di un sorgente in streaming su disco
+async function downloadSource(url, key, jobDir) {
   const safeKey = String(key).replace(/[^a-zA-Z0-9_-]/g, '_');
-  const outPath = path.join(TMP_ROOT, `source_${safeKey}.mp4`);
+  const outPath = path.join(jobDir, `source_${safeKey}.mp4`);
 
   if (fs.existsSync(outPath)) {
     log('Reusing downloaded file for', url);
@@ -55,22 +53,16 @@ async function downloadSource(url, key) {
   return outPath;
 }
 
-/**
- * Trimma una clip da un sorgente usando copia di stream (no re-encode).
- */
-async function trimClip(sourcePath, index, start, duration) {
-  const outPath = path.join(TMP_ROOT, `clip_${index}.mp4`);
+// Trim singola clip, SENZA ricodifica
+async function trimClip(sourcePath, index, start, duration, jobDir) {
+  const outPath = path.join(jobDir, `clip_${index}.mp4`);
 
   log(`Trim [${index}] from ${sourcePath} start=${start} dur=${duration}`);
 
   return new Promise((resolve, reject) => {
     ffmpeg(sourcePath)
-      .outputOptions([
-        `-ss ${start}`,
-        `-t ${duration}`,
-        '-c copy',
-        '-movflags +faststart',
-      ])
+      .inputOptions([`-ss ${start}`, `-t ${duration}`])
+      .outputOptions(['-c copy', '-movflags +faststart'])
       .on('error', (err) => {
         log('ffmpeg trim error', err.message || err);
         reject(err);
@@ -83,21 +75,19 @@ async function trimClip(sourcePath, index, start, duration) {
   });
 }
 
-/**
- * Concatena tutte le clip con il demuxer concat (no re-encode).
- */
-async function concatClips(clipPaths) {
+// Concat di tutte le clip, sempre in copia
+async function concatClips(clipPaths, jobDir) {
   if (!clipPaths.length) {
     throw new Error('No clips to concatenate');
   }
 
-  const listPath = path.join(TMP_ROOT, 'concat.txt');
+  const listPath = path.join(jobDir, 'concat.txt');
   const content = clipPaths
     .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
     .join('\n');
   fs.writeFileSync(listPath, content);
 
-  const outPath = path.join(TMP_ROOT, `montage_${Date.now()}.mp4`);
+  const outPath = path.join(jobDir, `montage_${Date.now()}.mp4`);
   log('Concatenating', clipPaths.length, 'clips ->', outPath);
 
   return new Promise((resolve, reject) => {
@@ -117,19 +107,23 @@ async function concatClips(clipPaths) {
   });
 }
 
-/**
- * Best-effort cleanup dei file temporanei.
- */
-function cleanup(paths) {
-  for (const p of paths) {
-    if (!p) continue;
-    fs.promises.unlink(p).catch(() => {});
+async function rimraf(dir) {
+  try {
+    await fs.promises.rm(dir, { recursive: true, force: true });
+  } catch {
+    // ignore
   }
 }
 
 app.post('/montage', async (req, res) => {
   const startedAt = Date.now();
-  let tempFiles = [];
+
+  // Cartella SEPARATA per ogni richiesta
+  const jobId =
+    Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+  const jobDir = path.join(TMP_ROOT, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  log('New job', jobId, 'dir=', jobDir);
 
   try {
     const body = req.body || {};
@@ -144,19 +138,22 @@ app.post('/montage', async (req, res) => {
 
     log(`Received ${clips.length} clips, using ${clips.length} clips as-is`);
 
-    // 1) Scarica ogni URL una sola volta (sequenziale per stare leggerissimi in RAM)
     const urlToPath = new Map();
+    let downloadIndex = 0;
+
+    // Download sequenziale, una sola volta per URL
     for (const clip of clips) {
       const url = clip.url;
       if (!url || urlToPath.has(url)) continue;
-      const localPath = await downloadSource(url, urlToPath.size);
+      const localPath = await downloadSource(url, downloadIndex, jobDir);
       urlToPath.set(url, localPath);
-      tempFiles.push(localPath);
+      downloadIndex += 1;
     }
 
-    // 2) Trimma tutte le clip in ordine, sempre in sequenza
     const trimmedPaths = [];
-    let index = 0;
+    let idx = 0;
+
+    // Trim di tutte le clip in sequenza
     for (const clip of clips) {
       const url = clip.url;
       const sourcePath = urlToPath.get(url);
@@ -168,22 +165,19 @@ app.post('/montage', async (req, res) => {
       const duration = Number(clip.duration ?? 0);
 
       if (!Number.isFinite(start) || !Number.isFinite(duration) || duration <= 0) {
-        continue; // frammento non valido → skippa
+        continue;
       }
 
-      const trimmedPath = await trimClip(sourcePath, index, start, duration);
+      const trimmedPath = await trimClip(sourcePath, idx, start, duration, jobDir);
       trimmedPaths.push(trimmedPath);
-      tempFiles.push(trimmedPath);
-      index += 1;
+      idx += 1;
     }
 
     if (!trimmedPaths.length) {
       return res.status(400).json({ error: 'No valid trimmed clips produced' });
     }
 
-    // 3) Concat finale
-    const finalPath = await concatClips(trimmedPaths);
-    tempFiles.push(finalPath);
+    const finalPath = await concatClips(trimmedPaths, jobDir);
 
     const stat = fs.statSync(finalPath);
     log('Final size =', stat.size, 'bytes');
@@ -204,14 +198,12 @@ app.post('/montage', async (req, res) => {
     rs.pipe(res);
 
     rs.on('close', () => {
-      log('Request finished in', Date.now() - startedAt, 'ms');
-      cleanup(tempFiles);
-      tempFiles = [];
+      log('Job', jobId, 'finished in', Date.now() - startedAt, 'ms');
+      rimraf(jobDir);
     });
   } catch (err) {
     log('Error in /montage', err?.message || err);
-    cleanup(tempFiles);
-    tempFiles = [];
+    await rimraf(jobDir);
     if (!res.headersSent) {
       res.status(500).json({ error: 'montage-failed', detail: String(err) });
     }
