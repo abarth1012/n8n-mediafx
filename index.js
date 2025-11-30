@@ -11,7 +11,7 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // per sicurezza
+app.use(express.urlencoded({ extended: true })); // per sicurezza su form-encoded
 
 // Cartella temporanea (Render monta /tmp)
 const TMP_DIR = path.join(os.tmpdir(), "mediafx");
@@ -39,7 +39,10 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim CON ricodifica leggera (taglio preciso)
+// 🔧 Trim CON ricodifica leggera, mantenendo la RISOLUZIONE ORIGINALE
+// - taglio preciso (niente più 1:01)
+// - stessa width/height del file Kling
+// - preset ultrafast + CRF 28 per stare leggeri su Render free
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
@@ -50,10 +53,11 @@ function trimClip(inputPath, start, duration, index) {
       .videoCodec("libx264")
       .audioCodec("aac")
       .outputOptions([
-        "-vf scale=960:-2",     // risoluzione ridotta (meno pesante)
-        "-preset ultrafast",    // minima CPU
-        "-crf 26",              // compressione alta, dimensioni ridotte
-        "-movflags +faststart"
+        // nessuno scale: mantieni la risoluzione originale
+        "-preset ultrafast",    // minimo carico CPU
+        "-crf 28",              // alta compressione (meno bitrate)
+        "-movflags +faststart",
+        "-pix_fmt yuv420p"      // massima compatibilità player
       ])
       .on("end", () => {
         console.log(
@@ -70,6 +74,7 @@ function trimClip(inputPath, start, duration, index) {
 }
 
 // 🔧 Concat di N clip tramite concat demuxer
+// Qui possiamo usare -c copy perché tutte le clip sono ora x264/AAC uniformi
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
@@ -87,7 +92,7 @@ function concatClips(clipPaths) {
         "-safe 0",
       ])
       .outputOptions([
-        "-c copy",              // tutte le clip ora sono x264/AAC uniformi
+        "-c copy",
         "-movflags +faststart",
       ])
       .output(outPath)
@@ -129,7 +134,9 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    const MAX_CLIPS = Number(process.env.MAX_CLIPS || 20);
+    // Limite di sicurezza (configurabile via env)
+    const MAX_CLIPS = Number(process.env.MAX_CLIPS || 30);
+
     const plan = clips
       .filter((c) => c && typeof c.url === "string")
       .slice(0, MAX_CLIPS)
