@@ -38,23 +38,26 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim + transcode leggera per UNIFORMARE le clip
+// 🔧 Trim di un singolo clip SENZA ricodifica
+// Per evitare di andare in OOM sul piano gratuito di Render,
+// usiamo il copy codec (-c copy) così ffmpeg non ricodifica audio/video.
+// L'accuratezza del taglio dipende dalla posizione dei keyframe: se non si
+// ricodifica potrebbe non essere perfetto al fotogramma, ma l'impatto
+// sull'utilizzo di memoria/CPU è minimo.
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
+    // fluent-ffmpeg posiziona -ss dopo l'input quando si usa setStartTime.
+    // combinato con -c copy, ffmpeg farà un trim veloce senza ricodifica.
     ffmpeg(inputPath)
-      .setStartTime(start)          // -ss
-      .duration(duration)           // -t
-      .videoCodec("libx264")
-      .audioCodec("aac")
+      .setStartTime(start)    // -ss <start>
+      .duration(duration)     // -t <duration>
       .outputOptions([
-        "-vf scale=1280:-2",        // un po' più alta di 720p ma non full-res
-        "-preset veryfast",         // non stressiamo troppo la CPU
-        "-crf 18",                  // qualità alta (più bassa di 20 = migliore)
-        "-movflags +faststart"
+        "-c copy",                 // copia audio/video senza transcodifica
+        "-movflags +faststart",    // utile per lo streaming
+        "-avoid_negative_ts make_zero" // corregge eventuali timestamp negativi
       ])
-      .output(outPath)
       .on("end", () => {
         console.log("Trim ok:", outPath);
         resolve(outPath);
@@ -63,7 +66,7 @@ function trimClip(inputPath, start, duration, index) {
         console.error("Trim error:", err.message || err);
         reject(err);
       })
-      .run();
+      .save(outPath);
   });
 }
 
@@ -116,7 +119,17 @@ app.get("/healthz", (req, res) => {
 // }
 app.post("/montage", async (req, res) => {
   try {
-    const { clips } = req.body;
+    // accettiamo sia JSON nativo che stringhe JSON inviate come campo "clips"
+    let { clips } = req.body;
+    try {
+      if (typeof clips === "string") {
+        // Se è una stringa, proviamo a fare parse. In caso di fallimento,
+        // verrà gestito più avanti come array vuoto.
+        clips = JSON.parse(clips);
+      }
+    } catch (err) {
+      console.warn("Could not parse clips JSON string:", err.message || err);
+    }
 
     if (!Array.isArray(clips) || clips.length === 0) {
       return res.status(400).json({ error: "No clips provided" });
