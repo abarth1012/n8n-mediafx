@@ -38,21 +38,21 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim di una clip con transcode leggera (più qualità del 720p)
+// 🔧 Trim + transcode leggera per UNIFORMARE le clip
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
     ffmpeg(inputPath)
-      .setStartTime(start)       // -ss
-      .duration(duration)        // -t
+      .setStartTime(start)          // -ss
+      .duration(duration)           // -t
       .videoCodec("libx264")
       .audioCodec("aac")
       .outputOptions([
-        "-vf scale=960:-2",      // 🔼 da 720 a 960 px di larghezza
-        "-preset veryfast",
-        "-crf 19",               // qualità leggermente migliore
-        "-movflags +faststart",
+        "-vf scale=1280:-2",        // un po' più alta di 720p ma non full-res
+        "-preset veryfast",         // non stressiamo troppo la CPU
+        "-crf 18",                  // qualità alta (più bassa di 20 = migliore)
+        "-movflags +faststart"
       ])
       .output(outPath)
       .on("end", () => {
@@ -67,7 +67,7 @@ function trimClip(inputPath, start, duration, index) {
   });
 }
 
-// 🔧 Concat di N clip tramite concat demuxer
+// 🔧 Concat di N clip tramite concat demuxer, SENZA ricodifica
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
@@ -85,9 +85,7 @@ function concatClips(clipPaths) {
         "-safe 0",
       ])
       .outputOptions([
-        "-c:v libx264",
-        "-crf 20",               // leggera compressione finale
-        "-preset veryfast",
+        "-c copy",                  // tutte le clip sono già x264+AAC uniformi
         "-movflags +faststart",
       ])
       .output(outPath)
@@ -109,6 +107,13 @@ app.get("/healthz", (req, res) => {
 });
 
 // ✅ endpoint principale: /montage
+// Body atteso:
+// {
+//   "clips": [
+//     { "url": "...", "start": 0, "duration": 2 },
+//     ...
+//   ]
+// }
 app.post("/montage", async (req, res) => {
   try {
     const { clips } = req.body;
@@ -117,8 +122,9 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // 👉 QUI: assicuriamoci di usare TUTTE le 10 clip
-    const limitedClips = clips.slice(0, 10);  // 10 clip max = 20s totali
+    // 🔒 SICUREZZA: limitiamo per non rischiare OOM
+    const MAX_CLIPS = 10;    // se vedi anche un OOM, prova a portarlo a 8
+    const limitedClips = clips.slice(0, MAX_CLIPS);
 
     const sourceCache = new Map();   // url -> localPath
 
