@@ -38,21 +38,25 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim SENZA ricodifica
+// 🔧 Trim SENZA ricodifica, usando esattamente start/duration
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
-    ffmpeg(inputPath)
-      .setStartTime(start)    // -ss
-      .duration(duration)     // -t
+    // Usiamo -ss come input option e -t come output option con -c copy
+    ffmpeg()
+      .input(inputPath)
+      .inputOptions([`-ss ${start}`]) // seek in input
       .outputOptions([
-        "-c copy",                     // niente ricodifica
+        `-t ${duration}`,         // durata esatta richiesta
+        "-c copy",                // niente ricodifica
         "-movflags +faststart",
-        "-avoid_negative_ts make_zero" // normalizza i timestamp
+        "-avoid_negative_ts make_zero",
       ])
       .on("end", () => {
-        console.log("Trim ok:", outPath);
+        console.log(
+          `Trim ok [${index}] from ${inputPath} start=${start} dur=${duration}`
+        );
         resolve(outPath);
       })
       .on("error", (err) => {
@@ -81,7 +85,7 @@ function concatClips(clipPaths) {
         "-safe 0",
       ])
       .outputOptions([
-        "-c copy",
+        "-c copy",              // copia secca dei flussi
         "-movflags +faststart",
       ])
       .output(outPath)
@@ -104,17 +108,18 @@ app.get("/healthz", (req, res) => {
 
 // ✅ endpoint principale: /montage
 // Body atteso:
-// { "clips": [ { "url": "...", "start": 0, "duration": 2 }, ... ] }
+// { "clips": [ { "url": "...", "start": 0, "duration": 10 }, ... ] }
 app.post("/montage", async (req, res) => {
   try {
-    // accettiamo sia JSON nativo che stringhe JSON
     let { clips } = req.body;
+
+    // clips può arrivare come stringa JSON dall'HTTP Request di n8n
     if (typeof clips === "string") {
       try {
         clips = JSON.parse(clips);
       } catch (err) {
-        console.warn("Could not parse clips JSON string:", err.message || err);
-        clips = [];
+        console.error("Invalid clips string:", err.message || err);
+        return res.status(400).json({ error: "Invalid clips payload" });
       }
     }
 
@@ -122,38 +127,48 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // 🔒 limita numero clip
-    const MAX_CLIPS = 10;
-    const limitedClips = clips.slice(0, MAX_CLIPS);
+    // Piccolo limite per sicurezza, ma non tocchiamo start/duration
+    const MAX_CLIPS = Number(process.env.MAX_CLIPS || 50);
 
-    // 🧹 normalizza + de-duplica (url+start+duration)
-    const normClips = [];
-    const seen = new Set();
+    const plan = clips
+      .filter((c) => c && typeof c.url === "string")
+      .slice(0, MAX_CLIPS)
+      .map((c, idx) => {
+        const start = Number(c.start) || 0;
+        let duration = Number(c.duration) || 10;
 
-    for (const raw of limitedClips) {
-      if (!raw || !raw.url) continue;
+        // se mi dici che ogni clip è 10s, questo garantisce che usiamo sempre 10s
+        if (!Number.isFinite(duration) || duration <= 0) {
+          duration = 10;
+        }
 
-      const start = Number(raw.start) || 0;
-      const duration = Math.max(0.1, Math.min(Number(raw.duration) || 2, 10));
+        return {
+          url: c.url,
+          start,
+          duration,
+          index: idx,
+        };
+      });
 
-      const key = `${raw.url}|${start.toFixed(3)}|${duration.toFixed(3)}`;
-      if (seen.has(key)) {
-        continue; // stessa clip già usata → evita ripetizioni
-      }
-      seen.add(key);
-      normClips.push({ url: raw.url, start, duration });
-    }
-
-    if (normClips.length === 0) {
+    if (plan.length === 0) {
       return res
         .status(400)
         .json({ error: "No valid clips after normalization" });
     }
 
+    console.log(
+      `Received ${clips.length} clips, using ${plan.length} clips as-is`
+    );
+    plan.forEach((c) =>
+      console.log(
+        ` -> clip [${c.index}] url=${c.url} start=${c.start} duration=${c.duration}`
+      )
+    );
+
     const sourceCache = new Map(); // url -> localPath
 
     // 1) Scarica le sorgenti (una volta sola per URL)
-    for (const clip of normClips) {
+    for (const clip of plan) {
       if (!sourceCache.has(clip.url)) {
         const localPath = await downloadToTmp(
           clip.url,
@@ -163,19 +178,17 @@ app.post("/montage", async (req, res) => {
       }
     }
 
-    // 2) Trim sequenziale di tutte le clip
+    // 2) Trim sequenziale di tutte le clip (esattamente quelle fornite)
     const trimmedPaths = [];
-    let index = 0;
-    for (const clip of normClips) {
+    for (const clip of plan) {
       const srcPath = sourceCache.get(clip.url);
       const trimmed = await trimClip(
         srcPath,
         clip.start,
         clip.duration,
-        index
+        clip.index
       );
       trimmedPaths.push(trimmed);
-      index++;
     }
 
     // 3) Concat finale
