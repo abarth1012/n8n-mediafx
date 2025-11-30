@@ -11,6 +11,7 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // per sicurezza
 
 // Cartella temporanea (Render monta /tmp)
 const TMP_DIR = path.join(os.tmpdir(), "mediafx");
@@ -38,20 +39,21 @@ async function downloadToTmp(url, filename) {
   return filePath;
 }
 
-// 🔧 Trim SENZA ricodifica, usando esattamente start/duration
+// 🔧 Trim CON ricodifica leggera (taglio preciso)
 function trimClip(inputPath, start, duration, index) {
   return new Promise((resolve, reject) => {
     const outPath = path.join(TMP_DIR, `clip_trim_${index}.mp4`);
 
-    // Usiamo -ss come input option e -t come output option con -c copy
-    ffmpeg()
-      .input(inputPath)
-      .inputOptions([`-ss ${start}`]) // seek in input
+    ffmpeg(inputPath)
+      .setStartTime(start)      // -ss start
+      .duration(duration)       // -t duration
+      .videoCodec("libx264")
+      .audioCodec("aac")
       .outputOptions([
-        `-t ${duration}`,         // durata esatta richiesta
-        "-c copy",                // niente ricodifica
-        "-movflags +faststart",
-        "-avoid_negative_ts make_zero",
+        "-vf scale=960:-2",     // risoluzione ridotta (meno pesante)
+        "-preset ultrafast",    // minima CPU
+        "-crf 26",              // compressione alta, dimensioni ridotte
+        "-movflags +faststart"
       ])
       .on("end", () => {
         console.log(
@@ -67,7 +69,7 @@ function trimClip(inputPath, start, duration, index) {
   });
 }
 
-// 🔧 Concat di N clip tramite concat demuxer, SENZA ricodifica
+// 🔧 Concat di N clip tramite concat demuxer
 function concatClips(clipPaths) {
   return new Promise((resolve, reject) => {
     const listPath = path.join(TMP_DIR, `concat_${Date.now()}.txt`);
@@ -85,7 +87,7 @@ function concatClips(clipPaths) {
         "-safe 0",
       ])
       .outputOptions([
-        "-c copy",              // copia secca dei flussi
+        "-c copy",              // tutte le clip ora sono x264/AAC uniformi
         "-movflags +faststart",
       ])
       .output(outPath)
@@ -108,7 +110,7 @@ app.get("/healthz", (req, res) => {
 
 // ✅ endpoint principale: /montage
 // Body atteso:
-// { "clips": [ { "url": "...", "start": 0, "duration": 10 }, ... ] }
+// { "clips": [ { "url": "...", "start": 0, "duration": 2 }, ... ] }
 app.post("/montage", async (req, res) => {
   try {
     let { clips } = req.body;
@@ -127,27 +129,16 @@ app.post("/montage", async (req, res) => {
       return res.status(400).json({ error: "No clips provided" });
     }
 
-    // Piccolo limite per sicurezza, ma non tocchiamo start/duration
-    const MAX_CLIPS = Number(process.env.MAX_CLIPS || 50);
-
+    const MAX_CLIPS = Number(process.env.MAX_CLIPS || 20);
     const plan = clips
       .filter((c) => c && typeof c.url === "string")
       .slice(0, MAX_CLIPS)
       .map((c, idx) => {
         const start = Number(c.start) || 0;
-        let duration = Number(c.duration) || 10;
+        let duration = Number(c.duration) || 2;
+        if (!Number.isFinite(duration) || duration <= 0) duration = 2;
 
-        // se mi dici che ogni clip è 10s, questo garantisce che usiamo sempre 10s
-        if (!Number.isFinite(duration) || duration <= 0) {
-          duration = 10;
-        }
-
-        return {
-          url: c.url,
-          start,
-          duration,
-          index: idx,
-        };
+        return { url: c.url, start, duration, index: idx };
       });
 
     if (plan.length === 0) {
@@ -178,7 +169,7 @@ app.post("/montage", async (req, res) => {
       }
     }
 
-    // 2) Trim sequenziale di tutte le clip (esattamente quelle fornite)
+    // 2) Trim sequenziale di tutte le clip
     const trimmedPaths = [];
     for (const clip of plan) {
       const srcPath = sourceCache.get(clip.url);
